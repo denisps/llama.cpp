@@ -2475,6 +2475,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--layer-streaming"},
+        "[EXPERIMENTAL] enable layer-by-layer streaming for models too large to fit in GPU memory.\n"
+        "Layers are double-buffered: layer N executes on GPU while layer N+1 is being uploaded",
+        [](common_params & params) {
+            params.layer_streaming = true;
+        }
+    ));
+    add_opt(common_arg(
         {"--lora"}, "FNAME",
         "path to LoRA adapter (use comma-separated values to load multiple adapters)",
         [](common_params & params, const std::string & value) {

@@ -372,6 +372,10 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool layer_streaming; // [EXPERIMENTAL] enable layer-by-layer streaming for models too large to fit in GPU memory
+                              // when enabled, only 2 layers worth of weights are kept in GPU memory at a time,
+                              // and layers are double-buffered: layer N executes on GPU while layer N+1 is being uploaded
+                              // requires the model to be loaded with weights accessible on CPU (mmap or RAM)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

@@ -370,6 +370,32 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // Initialize layer streaming if requested
+    if (params.layer_streaming && !hparams.vocab_only) {
+        ggml_backend_dev_t gpu_dev = nullptr;
+        for (auto * dev : model.devices) {
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                gpu_dev = dev;
+                break;
+            }
+        }
+        if (gpu_dev) {
+            try {
+                layer_streamer = std::make_unique<llama_layer_stream>(model, gpu_dev);
+                layer_stream_cb = std::make_unique<llama_layer_stream_eval_cb>();
+                layer_stream_cb->streamer = layer_streamer.get();
+                LLAMA_LOG_INFO("%s: layer streaming enabled\n", __func__);
+            } catch (const std::exception & e) {
+                LLAMA_LOG_WARN("%s: failed to initialize layer streaming: %s\n", __func__, e.what());
+                layer_streamer.reset();
+                layer_stream_cb.reset();
+            }
+        } else {
+            LLAMA_LOG_WARN("%s: layer streaming requested but no GPU device found\n", __func__);
+        }
+    }
 }
 
 llama_context::~llama_context() {
@@ -1192,7 +1218,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        // Set up eval callback - wrap with layer streaming if active
+        if (layer_streamer && layer_streamer->is_active() && layer_stream_cb) {
+            layer_stream_cb->original_cb = cparams.cb_eval;
+            layer_stream_cb->original_ud = cparams.cb_eval_user_data;
+            layer_stream_cb->last_layer_seen = -1;
+            ggml_backend_sched_set_eval_callback(sched.get(),
+                llama_layer_stream_eval_cb::callback, layer_stream_cb.get());
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1223,7 +1259,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // Begin layer streaming pass if active
+    if (layer_streamer && layer_streamer->is_active()) {
+        layer_streamer->begin_pass();
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    // End layer streaming pass
+    if (layer_streamer && layer_streamer->is_active()) {
+        // Finalize last layer if the callback didn't catch the end
+        if (layer_stream_cb && layer_stream_cb->last_layer_seen >= 0) {
+            layer_streamer->on_layer_end(layer_stream_cb->last_layer_seen);
+            layer_stream_cb->last_layer_seen = -1;
+        }
+        layer_streamer->end_pass();
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2903,6 +2955,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.layer_streaming             =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };

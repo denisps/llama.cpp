@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
+#include "llama-layer-stream.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -342,6 +343,10 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // layer streaming (double-buffered layer-by-layer GPU execution)
+    std::unique_ptr<llama_layer_stream>          layer_streamer;
+    std::unique_ptr<llama_layer_stream_eval_cb>  layer_stream_cb;
 
     // perf
     mutable int64_t t_start_us  = 0;
