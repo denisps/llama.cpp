@@ -8,16 +8,14 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
-// Helper: collect all non-null tensor pointers from a llama_layer struct.
-// We iterate the struct's known tensor fields. This uses offsetof-style enumeration.
+// Collect all non-null tensor pointers from a llama_layer struct.
 static std::vector<ggml_tensor *> get_layer_tensors(const llama_layer & layer) {
     std::vector<ggml_tensor *> tensors;
 
-    // Macro to add a tensor if non-null
     #define ADD_TENSOR(field) if (layer.field) tensors.push_back(layer.field)
 
     // normalization
@@ -268,23 +266,12 @@ static std::vector<ggml_tensor *> get_layer_tensors(const llama_layer & layer) {
     return tensors;
 }
 
-// Compute total size of tensors with proper alignment
-static size_t compute_layer_gpu_size(const std::vector<ggml_tensor *> & tensors, size_t alignment) {
-    size_t total = 0;
-    for (const auto * t : tensors) {
-        size_t size = ggml_nbytes(t);
-        // Align each tensor
-        total = (total + alignment - 1) & ~(alignment - 1);
-        total += size;
-    }
-    return total;
-}
+// --- Constructor ---
 
 llama_layer_stream::llama_layer_stream(
         const llama_model & model,
         ggml_backend_dev_t gpu_dev)
-    : model(model)
-    , gpu_dev(gpu_dev) {
+    : model(model) {
 
     buft = ggml_backend_dev_buffer_type(gpu_dev);
     if (!buft) {
@@ -317,14 +304,21 @@ llama_layer_stream::llama_layer_stream(
         max_layer_size = std::max(max_layer_size, layer_size);
     }
 
+    if (max_layer_size == 0) {
+        // No tensor data available (e.g. during llama_params_fit). Skip initialization.
+        ggml_backend_free(gpu_backend);
+        gpu_backend = nullptr;
+        active = false;
+        return;
+    }
+
     LLAMA_LOG_INFO("%s: max layer size = %.2f MiB, allocating 2 GPU pool buffers\n",
         __func__, max_layer_size / (1024.0 * 1024.0));
 
-    // Allocate two GPU buffer pools, each large enough for the biggest layer
+    // Allocate two GPU buffer pools
     for (int i = 0; i < 2; i++) {
         pools[i].buffer = ggml_backend_buft_alloc_buffer(buft, max_layer_size);
         if (!pools[i].buffer) {
-            // Clean up already allocated pool
             if (i > 0 && pools[0].buffer) {
                 ggml_backend_buffer_free(pools[0].buffer);
                 pools[0].buffer = nullptr;
@@ -334,6 +328,15 @@ llama_layer_stream::llama_layer_stream(
         pools[i].size = max_layer_size;
         pools[i].layer = -1;
         pools[i].ready = false;
+    }
+
+    // Permanently swap all layer tensor buffer pointers to GPU pool.
+    // This makes the scheduler route layer computation to GPU.
+    // The actual data will be copied into the correct pool before each layer executes.
+    for (int il = 0; il < nl; il++) {
+        for (auto & ti : layer_tensors[il]) {
+            ti.tensor->buffer = pools[0].buffer;
+        }
     }
 
     // Start background upload thread
@@ -358,12 +361,11 @@ llama_layer_stream::~llama_layer_stream() {
         upload_thread.join();
     }
 
-    // Restore any tensors that might still point to GPU
+    // Restore all tensor buffer/data pointers to CPU originals
     for (int il = 0; il < n_layers(); il++) {
         restore_layer_tensors(il);
     }
 
-    // Free GPU buffers
     for (int i = 0; i < 2; i++) {
         if (pools[i].buffer) {
             ggml_backend_buffer_free(pools[i].buffer);
@@ -389,7 +391,7 @@ void llama_layer_stream::build_layer_info(int il) {
 
     for (auto * t : tensors) {
         if (!t->data) {
-            continue; // skip unallocated tensors
+            continue;
         }
         tensor_info ti;
         ti.tensor     = t;
@@ -397,7 +399,6 @@ void llama_layer_stream::build_layer_info(int il) {
         ti.cpu_buffer = t->buffer;
         ti.size       = ggml_nbytes(t);
 
-        // Compute aligned offset within GPU pool
         offset = (offset + alignment - 1) & ~(alignment - 1);
         ti.gpu_offset = offset;
         offset += ti.size;
@@ -410,64 +411,121 @@ int llama_layer_stream::n_layers() const {
     return (int)model.layers.size();
 }
 
-ggml_backend_buffer_type_t llama_layer_stream::gpu_buft() const {
-    return buft;
-}
-
 bool llama_layer_stream::is_active() const {
     return active;
 }
 
-void llama_layer_stream::begin_pass() {
+bool llama_layer_stream::is_pass_active() const {
+    return active && pass_active;
+}
+
+bool llama_layer_stream::is_layer_boundary(ggml_tensor * t) const {
+    return layer_boundary_nodes.count(t) > 0;
+}
+
+// --- Graph pre-analysis ---
+// Scan graph nodes to find layer boundaries. For each layer, identify the
+// last graph node so the eval callback can return TRUE there (creating a
+// sync point for the double-buffered upload).
+
+void llama_layer_stream::pre_analyze_graph(ggml_cgraph * gf) {
+    layer_boundary_nodes.clear();
+
+    const int nn = ggml_graph_n_nodes(gf);
+    if (!gf || nn == 0) return;
+
+    // Pass 1: assign each node a layer index.
+    //   - If the node name contains a layer number, use it.
+    //   - Otherwise, inherit from the previous node.
+    //   Track which nodes had explicitly parsed indices vs inherited.
+    std::vector<int> node_layers(nn, -1);
+    std::vector<bool> node_parsed(nn, false);
+    for (int i = 0; i < nn; i++) {
+        int il = llama_layer_stream_eval_cb::parse_layer_from_name(
+                     ggml_get_name(ggml_graph_node(gf, i)));
+        if (il >= 0 && il < n_layers()) {
+            node_layers[i] = il;
+            node_parsed[i] = true;
+        } else if (i > 0) {
+            node_layers[i] = node_layers[i - 1];
+        }
+    }
+
+    // Pass 2: find the last explicitly-parsed node for each layer.
+    // This avoids treating post-layer nodes (result_norm, result_output)
+    // as boundaries for the last layer.
+    std::vector<int> last_parsed(n_layers(), -1);
+    for (int i = 0; i < nn; i++) {
+        int il = node_layers[i];
+        if (il >= 0 && node_parsed[i]) {
+            last_parsed[il] = i;
+        }
+    }
+    for (int il = 0; il < n_layers(); il++) {
+        if (last_parsed[il] >= 0) {
+            layer_boundary_nodes.insert(ggml_graph_node(gf, last_parsed[il]));
+        }
+    }
+
+    LLAMA_LOG_DEBUG("%s: identified %zu layer boundary nodes in graph with %d nodes\n",
+        __func__, layer_boundary_nodes.size(), nn);
+}
+
+// --- Pass management ---
+
+void llama_layer_stream::begin_pass(int n_tokens) {
     if (!active) return;
 
+    pass_active = true;
     current_layer = -1;
-
-    // Pre-load layer 0 synchronously into pool 0
-    upload_layer_sync(0, 0);
     active_pool = 0;
+
+    // Pre-load layer 0 into pool 0 synchronously
+    upload_layer_sync(0, 0);
+
+    // Start async upload of layer 1 into pool 1
+    if (n_layers() > 1) {
+        upload_layer_async_start(1, 1);
+    }
+
 }
 
 void llama_layer_stream::on_layer_begin(int il) {
     if (!active || il < 0 || il >= n_layers()) return;
-    if (il == current_layer) return; // already set up
+    if (il == current_layer) return;
 
     const int my_pool = active_pool;
 
-    // Wait for the upload to this pool to complete if it was async
+    // Wait for any pending async upload to complete
     if (!upload_done.load()) {
-        // The background thread is uploading to the other pool or this one
         std::unique_lock<std::mutex> lock(upload_mutex);
-        upload_cv.wait(lock, [this]() { return upload_done.load(); });
+        upload_cv.wait(lock, [this]() { return upload_done.load() || shutdown.load(); });
+        if (shutdown.load()) return;
     }
 
     // Verify the correct layer is in our pool
     if (pools[my_pool].layer != il || !pools[my_pool].ready) {
-        // Need to upload synchronously (shouldn't happen in normal flow)
         LLAMA_LOG_WARN("%s: sync upload needed for layer %d (pool %d has layer %d)\n",
             __func__, il, my_pool, pools[my_pool].layer);
         upload_layer_sync(il, my_pool);
     }
 
-    // Swap tensor data pointers to GPU
+    // Swap tensor data pointers to GPU pool
     swap_layer_tensors_to_gpu(il, my_pool);
     current_layer = il;
-
-    // Kick off async upload of next layer into the other pool
-    const int next_layer = il + 1;
-    if (next_layer < n_layers()) {
-        const int next_pool = 1 - my_pool;
-        upload_layer_async_start(next_layer, next_pool);
-    }
 }
 
 void llama_layer_stream::on_layer_end(int il) {
     if (!active || il < 0 || il >= n_layers()) return;
 
-    // Restore tensor pointers back to CPU
-    restore_layer_tensors(il);
+    // Kick off async upload of layer il+2 into the pool we're about to free.
+    // (layer il+1 is already uploaded or uploading to the other pool)
+    const int prefetch_layer = il + 2;
+    if (prefetch_layer < n_layers()) {
+        upload_layer_async_start(prefetch_layer, active_pool);
+    }
 
-    // Swap active pool for the next layer
+    // Swap active pool (next layer will use the other pool)
     active_pool = 1 - active_pool;
     current_layer = -1;
 }
@@ -478,36 +536,37 @@ void llama_layer_stream::end_pass() {
     // Wait for any pending upload
     if (!upload_done.load()) {
         std::unique_lock<std::mutex> lock(upload_mutex);
-        upload_cv.wait(lock, [this]() { return upload_done.load(); });
+        upload_cv.wait(lock, [this]() { return upload_done.load() || shutdown.load(); });
     }
 
-    // Ensure all tensors are restored to CPU pointers
+    // Restore all tensor data pointers to CPU (buffer stays at GPU for scheduler)
     for (int il = 0; il < n_layers(); il++) {
-        restore_layer_tensors(il);
+        for (auto & ti : layer_tensors[il]) {
+            ti.tensor->data = ti.cpu_data;
+            // Note: buffer stays pointing to GPU pool (for scheduler routing)
+        }
     }
 
+    pass_active = false;
     current_layer = -1;
 }
+
+// --- Upload mechanics ---
 
 void llama_layer_stream::upload_layer_sync(int il, int pool_idx) {
     if (il < 0 || il >= n_layers()) return;
 
     auto & pool = pools[pool_idx];
-    if (pool.layer == il && pool.ready) return; // already loaded
+    if (pool.layer == il && pool.ready) return;
 
     void * base = ggml_backend_buffer_get_base(pool.buffer);
 
     for (const auto & ti : layer_tensors[il]) {
         void * dst = (char *)base + ti.gpu_offset;
-        // Copy from CPU to GPU pool buffer
+        // On Apple Silicon unified memory, GPU shared buffers are CPU-accessible.
+        // memcpy writes directly to the shared buffer.
         memcpy(dst, ti.cpu_data, ti.size);
     }
-
-    // If the GPU buffer requires explicit uploading (non-unified memory),
-    // we use ggml_backend_tensor_set. For unified memory (Apple Silicon Metal),
-    // the memcpy above already works since shared buffers are used.
-    // For discrete GPUs, we'd need to use the proper upload mechanism.
-    // The Metal backend on Apple Silicon uses shared memory, so direct memcpy works.
 
     pool.layer = il;
     pool.ready = true;
@@ -519,7 +578,8 @@ void llama_layer_stream::upload_layer_async_start(int il, int pool_idx) {
     // Wait for any prior async upload to finish
     if (!upload_done.load()) {
         std::unique_lock<std::mutex> lock(upload_mutex);
-        upload_cv.wait(lock, [this]() { return upload_done.load(); });
+        upload_cv.wait(lock, [this]() { return upload_done.load() || shutdown.load(); });
+        if (shutdown.load()) return;
     }
 
     {
@@ -538,9 +598,7 @@ void llama_layer_stream::upload_thread_fn() {
             return !upload_done.load() || shutdown.load();
         });
 
-        if (shutdown.load()) {
-            break;
-        }
+        if (shutdown.load()) break;
 
         const int il = upload_request_layer;
         const int pi = upload_request_pool;
@@ -560,7 +618,6 @@ void llama_layer_stream::swap_layer_tensors_to_gpu(int il, int pool_idx) {
     void * base = ggml_backend_buffer_get_base(pool.buffer);
 
     for (auto & ti : layer_tensors[il]) {
-        // Point tensor to GPU buffer
         ti.tensor->data   = (char *)base + ti.gpu_offset;
         ti.tensor->buffer = pool.buffer;
     }
@@ -568,35 +625,36 @@ void llama_layer_stream::swap_layer_tensors_to_gpu(int il, int pool_idx) {
 
 void llama_layer_stream::restore_layer_tensors(int il) {
     for (auto & ti : layer_tensors[il]) {
-        // Restore original CPU data pointer
         ti.tensor->data   = ti.cpu_data;
         ti.tensor->buffer = ti.cpu_buffer;
     }
 }
 
-// --- Eval callback implementation ---
+// --- Eval callback ---
 
-// Parse layer index from tensor name (e.g., "attn_norm-5" -> 5)
-static int parse_layer_from_name(const char * name) {
+int llama_layer_stream_eval_cb::parse_layer_from_name(const char * name) {
     if (!name) return -1;
 
-    // Find the last '-' in the name
-    const char * dash = strrchr(name, '-');
-    if (!dash) return -1;
+    // Search backwards for a '-' followed by digits.
+    // Handles names like "Qcur-0", "Qcur-0 (reshaped)", "attn_norm-5"
+    const char * p = name + strlen(name);
+    while (p > name) {
+        --p;
+        if (*p == '-') {
+            char * end = nullptr;
+            long val = strtol(p + 1, &end, 10);
+            if (end != p + 1 && val >= 0 && val <= 10000) {
+                return (int)val;
+            }
+        }
+    }
 
-    // Parse the number after the dash
-    char * end = nullptr;
-    long val = strtol(dash + 1, &end, 10);
-    if (end == dash + 1 || *end != '\0') return -1;
-    if (val < 0 || val > 10000) return -1;
-
-    return (int)val;
+    return -1;
 }
 
 bool llama_layer_stream_eval_cb::callback(ggml_tensor * t, bool ask, void * user_data) {
     auto * self = (llama_layer_stream_eval_cb *)user_data;
     if (!self || !self->streamer || !self->streamer->is_active()) {
-        // Fall through to original callback
         if (self && self->original_cb) {
             return self->original_cb(t, ask, self->original_ud);
         }
@@ -604,27 +662,52 @@ bool llama_layer_stream_eval_cb::callback(ggml_tensor * t, bool ask, void * user
     }
 
     if (ask) {
-        // "ask" phase: detect layer transitions
+        // Detect layer transitions from tensor names
         int il = parse_layer_from_name(ggml_get_name(t));
 
         if (il >= 0 && il != self->last_layer_seen) {
-            // Entering a new layer
-            if (self->last_layer_seen >= 0) {
-                self->streamer->on_layer_end(self->last_layer_seen);
+            // New layer detected — swap this layer's weight data into the GPU pool
+            if (self->last_layer_seen < 0) {
+                // First layer in this split
+                self->streamer->on_layer_begin(il);
             }
-            self->streamer->on_layer_begin(il);
+            // Note: on_layer_end for the previous layer and on_layer_begin for
+            // this layer are handled in the result callback (after the batch
+            // for the previous layer has finished computing).
+            // For the very first layer, we swap in the ask phase since there's
+            // no prior result callback.
             self->last_layer_seen = il;
         }
 
-        // Forward to original callback
+        // Return TRUE at layer boundaries (last node of a layer) to create
+        // a sync point. This ensures the batch covers exactly one layer.
+        bool is_boundary = self->streamer->is_layer_boundary(t);
+
         if (self->original_cb) {
-            return self->original_cb(t, ask, self->original_ud);
+            bool orig = self->original_cb(t, ask, self->original_ud);
+            return orig || is_boundary;
         }
-        // Return false to indicate we don't need this specific node's output
-        // (the ask phase is asking "do you need the data for this node?")
-        return false;
+
+        return is_boundary;
+
     } else {
-        // "result" phase
+        // Result phase: a batch just finished computing and synced.
+        // This is the sync point — the ideal time to swap layers.
+
+        int il = parse_layer_from_name(ggml_get_name(t));
+
+        if (il >= 0 && self->last_layer_seen == il) {
+            // End of this layer's batch
+            self->streamer->on_layer_end(il);
+
+            // Prepare next layer
+            int next = il + 1;
+            if (next < self->streamer->n_layers()) {
+                self->streamer->on_layer_begin(next);
+                self->last_layer_seen = next;
+            }
+        }
+
         if (self->original_cb) {
             return self->original_cb(t, ask, self->original_ud);
         }

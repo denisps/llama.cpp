@@ -1327,6 +1327,17 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 
+    // Layer streaming requires weights on CPU in original (non-repacked) format
+    if (params.layer_streaming) {
+        if (mparams.n_gpu_layers != 0) {
+            LOG_INF("%s: layer streaming enabled, overriding n_gpu_layers from %d to 0\n",
+                __func__, mparams.n_gpu_layers);
+        }
+        mparams.n_gpu_layers    = 0;
+        mparams.use_mmap        = true;
+        mparams.use_extra_bufts = false; // disable REPACK - GPU needs original data format
+    }
+
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {

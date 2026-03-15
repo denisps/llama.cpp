@@ -1247,6 +1247,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        // Pre-analyze graph for layer boundaries (used by streaming callback)
+        if (layer_streamer && layer_streamer->is_active()) {
+            layer_streamer->pre_analyze_graph(gf);
+        }
     }
 
     // set the input data for the input tensors
@@ -1261,7 +1266,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // Begin layer streaming pass if active
     if (layer_streamer && layer_streamer->is_active()) {
-        layer_streamer->begin_pass();
+        layer_streamer->begin_pass(ubatch.n_tokens);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
