@@ -568,9 +568,9 @@ struct server_tool_edit_file : server_tool {
             }
             int n = (int) lines.size();
             if (e.line_start == -1) {
-                // -1 means end of file; line_end is ignored — normalize to point past last line
+                // -1 means end of file; line_end is ignored — normalize so idx_end+1 == lines.size()
                 e.line_start = n + 1;
-                e.line_end   = n + 1;
+                e.line_end   = n;
             } else {
                 if (e.line_start < 1 || e.line_end < e.line_start) {
                     return {{"error", string_format("invalid line range [%d, %d]", e.line_start, e.line_end)}};
@@ -611,7 +611,7 @@ struct server_tool_edit_file : server_tool {
             } else if (e.mode == "delete") {
                 lines.erase(lines.begin() + idx_start, lines.begin() + idx_end + 1);
             } else { // append
-                // idx_end + 1 may equal lines.size() when line_start == -1 (end of file)
+                // when line_start==-1: idx_end+1 == lines.size() == end()
                 lines.insert(lines.begin() + idx_end + 1, new_lines.begin(), new_lines.end());
             }
         }
